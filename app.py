@@ -1,62 +1,70 @@
 import os
-from flask import Flask, render_template, request, redirect, url_for, flash
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user
 from datetime import datetime, timedelta
 import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
+from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'wtf-hostel-ultra-premium-key'
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", "change-this-secret")
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///instance/hostel.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
-# --- پیکربندی تلگرام ---
-BOT_TOKEN = "8702709953:AAEy6xPvd-WhuhatRY7fmzMsDT7qMchXnFQ22"
-ADMIN_CHAT_ID = "220668411" 
-bot = telebot.TeleBot(BOT_TOKEN)
+# --- تلگرام (امن) ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+bot = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
 
-# --- مدل‌های دیتابیس (ساختار اطلاعات) ---
-
+# --- مدل‌ها ---
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True)
-    password = db.Column(db.String(50))
+    password = db.Column(db.String(200))
+    role = db.Column(db.String(20), default="admin")
+
 
 class Room(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(50), nullable=False)
-    capacity = db.Column(db.Integer, nullable=False)
-    price_per_night = db.Column(db.Float, default=0.0)
+    name = db.Column(db.String(50))
+    capacity = db.Column(db.Integer)
+    room_type = db.Column(db.String(20), default="استاندارد")
     bookings = db.relationship('Booking', backref='room', lazy=True)
+
 
 class Booking(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    customer_name = db.Column(db.String(100), nullable=False)
-    room_id = db.Column(db.Integer, db.ForeignKey('room.id'), nullable=False)
-    bed_number = db.Column(db.Integer, nullable=False)
-    stay_days = db.Column(db.Integer, nullable=False)
-    total_paid = db.Column(db.Float, nullable=False)
+    customer_name = db.Column(db.String(100))
+    room_id = db.Column(db.Integer, db.ForeignKey('room.id'))
+    bed_number = db.Column(db.Integer)
+    stay_days = db.Column(db.Integer)
+    amount_paid = db.Column(db.Float)
     phone = db.Column(db.String(20))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    start_date = db.Column(db.DateTime, default=datetime.utcnow)
 
-    def get_expiry_date(self):
-        return self.created_at + timedelta(days=self.stay_days)
+    def end_date(self):
+        return self.start_date + timedelta(days=self.stay_days)
 
-    def days_remaining(self):
-        delta = self.get_expiry_date() - datetime.utcnow()
-        return max(0, delta.days)
+    def days_left(self):
+        remaining = (self.end_date() - datetime.utcnow()).days
+        return max(0, remaining)
+
 
 class Expense(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(100), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
-    category = db.Column(db.String(50)) # نظافت، قبض، تعمیرات
+    item_name = db.Column(db.String(100))
+    category = db.Column(db.String(50))
+    cost = db.Column(db.Float)
     date = db.Column(db.DateTime, default=datetime.utcnow)
 
-# --- مدیریت لاگین ---
+
+# --- Login ---
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
@@ -64,45 +72,54 @@ login_manager.login_view = 'login'
 def load_user(user_id):
     return User.query.get(int(user_id))
 
-# --- وظایف خودکار تلگرام ---
-def telegram_auto_report():
+
+# --- Telegram Report ---
+def send_daily_report():
+    if not bot:
+        return
+
     with app.app_context():
         rooms = Room.query.all()
         bookings = Booking.query.all()
-        total_beds = sum([r.capacity for r in rooms])
+
+        total_beds = sum(r.capacity for r in rooms)
         occupied = len(bookings)
-        
-        msg = f"🏨 *گزارش وضعیت WTF HOSTEL*\n"
-        msg += f"────────────────\n"
-        msg += f"✅ تخت‌های خالی: {total_beds - occupied}\n"
-        msg += f"🚫 تخت‌های پر: {occupied}\n\n"
-        
-        expiring_soon = [b for b in bookings if b.days_remaining() <= 1]
-        if expiring_soon:
-            msg += "🚨 *هشدار تمدید یا تخلیه:*\n"
-            for b in expiring_soon:
-                msg += f"👤 {b.customer_name} | {b.room.name} (تخت {b.bed_number})\n"
-        
+
+        msg = "🏨 گزارش روزانه هاستل\n\n"
+        msg += f"📊 اشغال: {occupied}/{total_beds}\n"
+        msg += f"📈 نرخ اشغال: {(occupied/total_beds)*100:.1f}%\n\n"
+
+        expiring = [b for b in bookings if b.days_left() <= 1]
+        if expiring:
+            msg += "🚨 در حال اتمام:\n"
+            for b in expiring:
+                msg += f"- {b.customer_name} ({b.room.name})\n"
+
         try:
-            bot.send_message(ADMIN_CHAT_ID, msg, parse_mode="Markdown")
-        except Exception as e:
-            print(f"Telegram Error: {e}")
+            bot.send_message(ADMIN_CHAT_ID, msg)
+        except:
+            pass
+
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=telegram_auto_report, trigger="cron", hour=10) # هر روز ساعت ۱۰ صبح
+scheduler.add_job(send_daily_report, 'cron', hour=9)
 scheduler.start()
 
-# --- مسیرها (Routes) ---
 
+# --- Routes ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         user = User.query.filter_by(username=request.form['username']).first()
-        if user and user.password == request.form['password']:
+
+        if user and check_password_hash(user.password, request.form['password']):
             login_user(user)
             return redirect(url_for('dashboard'))
-        flash('خطا در ورود!')
+
+        flash("❌ اطلاعات اشتباه است")
+
     return render_template('login.html')
+
 
 @app.route('/')
 @login_required
@@ -110,70 +127,114 @@ def dashboard():
     rooms = Room.query.all()
     bookings = Booking.query.all()
     expenses = Expense.query.all()
-    
-    # محاسبات آماری
-    income = sum([b.total_paid for b in bookings])
-    costs = sum([e.amount for e in expenses])
-    total_beds = sum([r.capacity for r in rooms])
-    
-    return render_template('dashboard.html', 
-                           rooms=rooms, bookings=bookings, expenses=expenses,
-                           full=len(bookings), empty=total_beds - len(bookings),
-                           income=income, costs=costs)
 
-@app.route('/add_booking', methods=['POST'])
+    total_income = sum(b.amount_paid for b in bookings)
+    total_expenses = sum(e.cost for e in expenses)
+    profit = total_income - total_expenses
+
+    total_capacity = sum(r.capacity for r in rooms)
+    occupancy = len(bookings)
+
+    return render_template(
+        'dashboard.html',
+        rooms=rooms,
+        bookings=bookings,
+        income=total_income,
+        costs=total_expenses,
+        profit=profit,
+        occupancy=occupancy,
+        capacity=total_capacity,
+        rate=(occupancy/total_capacity*100) if total_capacity else 0
+    )
+
+
+# --- جلوگیری از Overbooking ---
+@app.route('/add_customer', methods=['POST'])
 @login_required
-def add_booking():
-    new_b = Booking(
+def add_customer():
+    room = Room.query.get(request.form['room_id'])
+    current = Booking.query.filter_by(room_id=room.id).count()
+
+    if current >= room.capacity:
+        flash("❌ ظرفیت اتاق پر است")
+        return redirect(url_for('dashboard'))
+
+    booking = Booking(
         customer_name=request.form['name'],
-        room_id=request.form['room_id'],
+        room_id=room.id,
         bed_number=request.form['bed_num'],
         stay_days=int(request.form['days']),
-        total_paid=float(request.form['price']),
-        phone=request.form.get('phone')
+        amount_paid=float(request.form['price']),
+        phone=request.form.get('phone', '')
     )
-    db.session.add(new_b)
+
+    db.session.add(booking)
     db.session.commit()
     return redirect(url_for('dashboard'))
 
-@app.route('/delete_booking/<int:id>')
+
+@app.route('/checkout/<int:id>')
 @login_required
-def delete_booking(id):
-    b = Booking.query.get(id)
-    db.session.delete(b)
+def checkout(id):
+    booking = Booking.query.get_or_404(id)
+    db.session.delete(booking)
     db.session.commit()
+    flash("✔ تخلیه انجام شد")
     return redirect(url_for('dashboard'))
+
 
 @app.route('/add_expense', methods=['POST'])
 @login_required
 def add_expense():
-    new_e = Expense(
-        title=request.form['title'],
-        amount=float(request.form['amount']),
-        category=request.form.get('category')
-    )
-    db.session.add(new_e)
+    db.session.add(Expense(
+        item_name=request.form['item'],
+        category=request.form.get('category', 'سایر'),
+        cost=float(request.form['cost'])
+    ))
     db.session.commit()
     return redirect(url_for('dashboard'))
 
+
+@app.route('/api/stats')
+@login_required
+def api_stats():
+    bookings = Booking.query.all()
+    expenses = Expense.query.all()
+
+    return jsonify({
+        "income": sum(b.amount_paid for b in bookings),
+        "expenses": sum(e.cost for e in expenses),
+        "bookings": len(bookings)
+    })
+
+
 @app.route('/logout')
+@login_required
 def logout():
     logout_user()
     return redirect(url_for('login'))
 
-# --- مقداردهی اولیه ---
+
+# --- Init DB ---
 with app.app_context():
     db.create_all()
+
     if not User.query.filter_by(username='admin').first():
-        db.session.add(User(username='admin', password='123'))
-        # ساخت ۴ اتاق طبق سناریوی شما
+        admin = User(
+            username='admin',
+            password=generate_password_hash('123')
+        )
+        db.session.add(admin)
+
         db.session.add_all([
-            Room(name="اتاق شماره ۱", capacity=3),
-            Room(name="اتاق شماره ۲", capacity=3),
-            Room(name="اتاق شماره ۳", capacity=6),
-            Room(name="اتاق شماره ۴", capacity=9)
+            Room(name="اتاق ۱", capacity=3, room_type="VIP"),
+            Room(name="اتاق ۲", capacity=3, room_type="استاندارد"),
+            Room(name="اتاق ۳", capacity=6, room_type="عمومی"),
+            Room(name="اتاق ۴", capacity=9, room_type="اقتصادی")
         ])
+
         db.session.commit()
 
+
 if __name__ == '__main__':
-    app.run()
+    app.run(debug=True)
