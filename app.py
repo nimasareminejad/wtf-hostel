@@ -17,7 +17,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
-# --- تلگرام (امن) ---
+# --- تلگرام ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
 bot = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
@@ -44,12 +44,20 @@ class Booking(db.Model):
     room_id = db.Column(db.Integer, db.ForeignKey('room.id'))
     bed_number = db.Column(db.Integer)
     stay_days = db.Column(db.Integer)
-    amount_paid = db.Column(db.Float)
     phone = db.Column(db.String(20))
     start_date = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # فیلدهای اضافه شده طبق درخواست شما
+    total_amount = db.Column(db.Float, default=0.0)  # مبلغ کل
+    amount_paid = db.Column(db.Float, default=0.0)   # مبلغ پرداخت شده
 
     def end_date(self):
         return self.start_date + timedelta(days=self.stay_days)
+
+    def debt_amount(self):
+        """محاسبه بدهکاری"""
+        debt = self.total_amount - self.amount_paid
+        return debt if debt > 0 else 0
 
     def days_left(self):
         remaining = (self.end_date() - datetime.utcnow()).days
@@ -111,15 +119,11 @@ scheduler.start()
 def login():
     if request.method == 'POST':
         user = User.query.filter_by(username=request.form['username']).first()
-
         if user and check_password_hash(user.password, request.form['password']):
             login_user(user)
             return redirect(url_for('dashboard'))
-
         flash("❌ اطلاعات اشتباه است")
-
     return render_template('login.html')
-
 
 @app.route('/')
 @login_required
@@ -148,7 +152,6 @@ def dashboard():
     )
 
 
-# --- جلوگیری از Overbooking ---
 @app.route('/add_customer', methods=['POST'])
 @login_required
 def add_customer():
@@ -159,12 +162,14 @@ def add_customer():
         flash("❌ ظرفیت اتاق پر است")
         return redirect(url_for('dashboard'))
 
+    # دریافت مقادیر جدید از فرم
     booking = Booking(
         customer_name=request.form['name'],
         room_id=room.id,
         bed_number=request.form['bed_num'],
         stay_days=int(request.form['days']),
-        amount_paid=float(request.form['price']),
+        total_amount=float(request.form['total_price']), # مبلغ کل
+        amount_paid=float(request.form['paid_price']),   # مبلغ پرداخت شده
         phone=request.form.get('phone', '')
     )
 
@@ -200,7 +205,6 @@ def add_expense():
 def api_stats():
     bookings = Booking.query.all()
     expenses = Expense.query.all()
-
     return jsonify({
         "income": sum(b.amount_paid for b in bookings),
         "expenses": sum(e.cost for e in expenses),
@@ -218,21 +222,18 @@ def logout():
 # --- Init DB ---
 with app.app_context():
     db.create_all()
-
     if not User.query.filter_by(username='admin').first():
         admin = User(
             username='admin',
             password=generate_password_hash('123')
         )
         db.session.add(admin)
-
         db.session.add_all([
             Room(name="اتاق ۱", capacity=3, room_type="VIP"),
             Room(name="اتاق ۲", capacity=3, room_type="استاندارد"),
             Room(name="اتاق ۳", capacity=6, room_type="عمومی"),
             Room(name="اتاق ۴", capacity=9, room_type="اقتصادی")
         ])
-
         db.session.commit()
 
 
